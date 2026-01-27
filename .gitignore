@@ -13,7 +13,8 @@ dist/
 .ruff_cache/
 .mypy_cache/
 
-# IDE.
+# IDE/ OS.
+.DS_Store
 .zed/
 .vscode/
 .idea/
