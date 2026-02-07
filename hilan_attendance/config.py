@@ -46,6 +46,7 @@ def save_config(config: Config, path: Optional[Path] = None) -> None:
 
 	try:
 		config_path.write_text(config.model_dump_json(indent=2), encoding='utf-8')
+		config_path.chmod(0o600)
 	except OSError as e:
 		raise OSError(f'Failed to save config to {config_path}: {e}') from e
 
