@@ -699,44 +699,44 @@ class CalendarPage(BasePage):
 
 			# Step 2: Click all days in the calendar
 			logger.debug('🖱️  Selecting %d days...', len(records_to_fill))
-			day_numbers = [record_date.day for record_date, _, _, _ in records_to_fill]
+			day_numbers = list(
+				dict.fromkeys(record_date.day for record_date, _, _, _ in records_to_fill)
+			)
 
 			clicked = self.page.evaluate(
 				f"""
 				(dayNumbers) => {{
+					const isVisible = (el) => {{
+						const style = window.getComputedStyle(el);
+						const rect = el.getBoundingClientRect();
+						return (
+							style.display !== 'none' &&
+							style.visibility !== 'hidden' &&
+							rect.width > 0 &&
+							rect.height > 0
+						);
+					}};
+
 					const clickedDays = [];
 					const failedDays = [];
 
 					for (const dayNum of dayNumbers) {{
-						// Find day cell by aria-label
-						const cells = document.querySelectorAll('td[days][aria-label="' + dayNum + '"]');
-						let clicked = false;
+						const cells = Array.from(
+							document.querySelectorAll('td[days][aria-label="' + dayNum + '"]')
+						).filter((cell) => isVisible(cell) && (cell.onclick || cell.getAttribute('onclick')));
 
-						for (const cell of cells) {{
-							// Click on this day (prefer unfilled cells)
-							if (!cell.classList.contains('{Selector.FILLED_DAY_CLASS}') && cell.onclick) {{
-								cell.click();
-								clickedDays.push(dayNum);
-								clicked = true;
-								break;
-							}}
-						}}
-
-						// If not clicked yet, try any cell with this day number
-						if (!clicked && cells.length > 0) {{
-							for (const cell of cells) {{
-								if (cell.onclick) {{
-									cell.click();
-									clickedDays.push(dayNum);
-									clicked = true;
-									break;
-								}}
-							}}
-						}}
-
-						if (!clicked) {{
+						if (cells.length === 0) {{
 							failedDays.push(dayNum);
+							continue;
 						}}
+
+						const preferred = cells.find(
+							(cell) => !cell.classList.contains('{Selector.FILLED_DAY_CLASS}')
+						);
+						const cell = preferred || cells[0];
+						cell.scrollIntoView({{ block: 'center', inline: 'center' }});
+						cell.click();
+						clickedDays.push(dayNum);
 					}}
 
 					return {{ clickedDays, failedDays }};
@@ -760,8 +760,53 @@ class CalendarPage(BasePage):
 			btn = self.page.locator(f'input[value="{Buttons.SELECTED_DAYS}"]')
 			if btn.count() > 0:
 				btn.first.click()
+				self.page.wait_for_timeout(Timing.WAIT_AFTER_CLICK)
+				no_selection_popup = self.page.locator('text=יש לבחור יום אחד לפחות בלוח')
+				if no_selection_popup.count() > 0 and no_selection_popup.first.is_visible():
+					logger.warning(
+						'Hilan reported no selected days, retrying selection via Playwright...'
+					)
+					ok_btn = self.page.locator('input[value="אישור"], button:has-text("אישור")')
+					if ok_btn.count() > 0 and ok_btn.first.is_visible():
+						ok_btn.first.click()
+						self.page.wait_for_timeout(Timing.WAIT_AFTER_CLEAR)
+
+					if clear_btn.count() > 0 and clear_btn.is_visible():
+						clear_btn.first.click()
+						self.page.wait_for_timeout(Timing.WAIT_AFTER_CLEAR)
+
+					retry_clicked_days: list[int] = []
+					retry_failed_days: list[int] = []
+					for day_num in day_numbers:
+						day_cells = self.page.locator(f'td[days][aria-label="{day_num}"]')
+						day_clicked = False
+						for idx in range(day_cells.count()):
+							cell = day_cells.nth(idx)
+							if not cell.is_visible():
+								continue
+							try:
+								cell.click()
+								retry_clicked_days.append(day_num)
+								day_clicked = True
+								break
+							except Exception:
+								continue
+						if not day_clicked:
+							retry_failed_days.append(day_num)
+
+					if retry_failed_days:
+						logger.warning('Retry could not click days: %s', retry_failed_days)
+					if not retry_clicked_days:
+						logger.error('Retry failed to select any days')
+						return 0, len(records_to_fill)
+
+					btn.first.click()
+					self.page.wait_for_timeout(Timing.WAIT_AFTER_CLICK)
+					if no_selection_popup.count() > 0 and no_selection_popup.first.is_visible():
+						logger.error('Hilan still reports no selected days after retry')
+						return 0, len(records_to_fill)
+
 				self.page.wait_for_timeout(Timing.WAIT_FOR_TABLE_LOAD)
-				self.wait_for_load()
 			else:
 				logger.warning('Could not find "Selected Days" button')
 
@@ -773,21 +818,16 @@ class CalendarPage(BasePage):
 			for record_date, entry_time, exit_time, work_type in records_to_fill:
 				if not work_type.hilan_code:
 					continue
-					day_key = f'{record_date.day:02d}/{record_date.month:02d}'
-					fill_map[day_key] = {
-						'entry': entry_time.strftime('%H:%M') if entry_time else None,
-						'exit': exit_time.strftime('%H:%M') if exit_time else None,
-						'workCode': work_type.hilan_code,
-					}
+				day_key = f'{record_date.day:02d}/{record_date.month:02d}'
+				fill_map[day_key] = {
+					'entry': entry_time.strftime('%H:%M') if entry_time else None,
+					'exit': exit_time.strftime('%H:%M') if exit_time else None,
+					'workCode': work_type.hilan_code,
+				}
 
 			result = self.page.evaluate(
-				rf"""
+				r"""
 				(fillMap) => {{
-					const rows = document.querySelectorAll('tr[id*="_row_"]');
-					if (rows.length === 0) {{
-						return {{ success: false, error: 'No detail rows found', filled: 0 }};
-					}}
-
 					const pickEditable = (elements) => {{
 						const all = Array.from(elements);
 						if (all.length === 0) return null;
@@ -797,17 +837,29 @@ class CalendarPage(BasePage):
 					}};
 
 					const normalizeDate = (dateText) => {{
-						const match = dateText.match(/^(\d{{1,2}})\/(\d{{1,2}})$/);
+						const match = (dateText || '').match(/(\d{{1,2}})\/(\d{{1,2}})/);
 						if (!match) return null;
 						return match[1].padStart(2, '0') + '/' + match[2].padStart(2, '0');
 					}};
 
 					let filled = 0;
+					let matched = 0;
 					const errors = [];
-					for (const [i, row] of Array.from(rows).entries()) {{
+					const dateCells = Array.from(
+						document.querySelectorAll('td[id*="_cellOf_ReportDate_row_"]')
+					);
+					if (dateCells.length === 0) {{
+						return {{ success: false, error: 'No detail rows found', filled: 0, matched: 0 }};
+					}}
+
+					for (const [i, dateCell] of dateCells.entries()) {{
 						try {{
-							const dateCell = row.querySelector('td[id*="ReportDate"]');
-							const dateRaw = dateCell?.textContent?.trim()?.split(' ')[0] || '';
+							const idMatch = (dateCell.id || '').match(/_cellOf_ReportDate_row_(\d+)/);
+							if (!idMatch) {{
+								continue;
+							}}
+							const rowIndex = idMatch[1];
+							const dateRaw = (dateCell.getAttribute('ov') || dateCell.textContent || '').trim();
 							const dateText = normalizeDate(dateRaw);
 							if (!dateText) {{
 								errors.push('Row ' + i + ': invalid date text "' + dateRaw + '"');
@@ -818,16 +870,29 @@ class CalendarPage(BasePage):
 							if (!fillData) {{
 								continue;
 							}}
+							matched++;
 
-							const entryInput = pickEditable(row.querySelectorAll('{Selector.ENTRY_INPUT}'));
-							const exitInput = pickEditable(row.querySelectorAll('{Selector.EXIT_INPUT}'));
-							const symbolSelect = pickEditable(row.querySelectorAll('{Selector.WORK_TYPE_SELECT}'));
+							const entryCell = document.querySelector(
+								`td[id*="_cellOf_ManualEntry_EmployeeReports_row_${{rowIndex}}_0"]`
+							);
+							const exitCell = document.querySelector(
+								`td[id*="_cellOf_ManualExit_EmployeeReports_row_${{rowIndex}}_0"]`
+							);
+							const symbolCell = document.querySelector(
+								`td[id*="_cellOf_Symbol.SymbolId_EmployeeReports_row_${{rowIndex}}_0"]`
+							);
+
+							const entryInput = pickEditable(entryCell?.querySelectorAll('input') || []);
+							const exitInput = pickEditable(exitCell?.querySelectorAll('input') || []);
+							const symbolSelect = pickEditable(symbolCell?.querySelectorAll('select') || []);
+							let wrote = false;
 
 							// Fill entry time (skip for partial days)
 							if (entryInput && fillData.entry !== null) {{
 								entryInput.value = fillData.entry;
 								entryInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
 								entryInput.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+								wrote = true;
 							}}
 
 							// Fill exit time (skip for partial days)
@@ -835,15 +900,21 @@ class CalendarPage(BasePage):
 								exitInput.value = fillData.exit;
 								exitInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
 								exitInput.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+								wrote = true;
 							}}
 
 							// Set work type
 							if (symbolSelect) {{
 								symbolSelect.value = fillData.workCode;
 								symbolSelect.dispatchEvent(new Event('change', {{ bubbles: true }}));
+								wrote = true;
 							}}
 
-							filled++;
+							if (wrote) {{
+								filled++;
+							}} else {{
+								errors.push('Row ' + i + ': no editable controls for ' + dateText);
+							}}
 						}} catch (err) {{
 							errors.push('Row ' + i + ': ' + err.message);
 						}}
@@ -852,7 +923,8 @@ class CalendarPage(BasePage):
 					return {{
 						success: filled > 0,
 						filled: filled,
-						totalRows: rows.length,
+						totalRows: dateCells.length,
+						matched: matched,
 						errors: errors
 					}};
 				}}
@@ -861,7 +933,13 @@ class CalendarPage(BasePage):
 			)
 
 			if not result.get('success'):
-				logger.error('Failed to fill any rows: %s', result.get('error', 'Unknown error'))
+				errors = result.get('errors') or []
+				extra = f' matched={result.get("matched", 0)} rows={result.get("totalRows", 0)}'
+				if errors:
+					extra += f' first_error={errors[0]}'
+				logger.error(
+					'Failed to fill any rows: %s%s', result.get('error', 'Unknown error'), extra
+				)
 				return 0, len(records_to_fill)
 
 			filled_count = result.get('filled', 0)
