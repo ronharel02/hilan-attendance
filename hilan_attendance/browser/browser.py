@@ -114,7 +114,7 @@ class HilanBrowser:
 
 	def fill_batch_attendance(
 		self,
-		records_to_fill: list[tuple[date, time, time, WorkType]],
+		records_to_fill: list[tuple[date, Optional[time], Optional[time], WorkType]],
 		dry_run: bool = False,
 	) -> tuple[int, int]:
 		"""Fill attendance for multiple days in one batch.

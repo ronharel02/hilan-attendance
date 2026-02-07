@@ -4,7 +4,7 @@ import calendar as cal
 import re
 from datetime import date, time
 from enum import IntEnum
-from typing import Optional
+from typing import Any, Optional
 
 from playwright.sync_api import Locator
 
@@ -19,7 +19,10 @@ def parse_time_string(time_str: str) -> Optional[time]:
 	if not time_str:
 		return None
 	if match := re.compile(r'^(\d{1,2}):(\d{2})$').match(time_str.strip()):
-		return time(int(match.group(1)), int(match.group(2)))
+		try:
+			return time(int(match.group(1)), int(match.group(2)))
+		except ValueError:
+			return None
 	return None
 
 
@@ -235,12 +238,57 @@ class CalendarPage(BasePage):
 			logger.warning('No days found in calendar')
 			return MonthAttendance(year=year, month=month, records=[])
 
-		filled_days = [r for r in records if r.has_existing_entry]
-		logger.debug('Selecting %d filled days...', len(filled_days))
+		selected_info = self.page.evaluate(
+			r"""
+			() => {
+				const isVisible = (el) => {
+					const style = window.getComputedStyle(el);
+					const rect = el.getBoundingClientRect();
+					return (
+						style.display !== 'none' &&
+						style.visibility !== 'hidden' &&
+						rect.width > 0 &&
+						rect.height > 0
+					);
+				};
 
-		# Click all filled days instantly with JavaScript
-		self.page.evaluate(
-			f"() => document.querySelectorAll('td.{Selector.FILLED_DAY_CLASS}').forEach(c => c.click())"
+				const hasData = (cell) => {
+					if (cell.classList.contains('cDIES')) return true;
+
+					const title = (cell.getAttribute('title') || '').trim();
+					if (title && title !== '\u00a0') return true;
+
+					const marker = (cell.querySelector('.cDM')?.textContent || '')
+						.replace(/\u00a0/g, '')
+						.trim();
+					return marker.length > 0;
+				};
+
+				const clickedDays = [];
+				const seenDayKeys = new Set();
+
+				for (const cell of document.querySelectorAll('td[days]')) {
+					if (!cell.onclick || !isVisible(cell) || !hasData(cell)) {
+						continue;
+					}
+
+					const dayKey = cell.getAttribute('days') || '';
+					if (!dayKey || seenDayKeys.has(dayKey)) {
+						continue;
+					}
+
+					seenDayKeys.add(dayKey);
+					cell.click();
+					clickedDays.push((cell.getAttribute('aria-label') || dayKey).trim());
+				}
+
+				return {
+					count: clickedDays.length,
+					daysSample: clickedDays.slice(0, 10),
+					dayKeys: Array.from(seenDayKeys),
+				};
+			}
+			"""
 		)
 
 		# Click "ימים נבחרים" to load detail table
@@ -253,58 +301,330 @@ class CalendarPage(BasePage):
 			logger.warning('Could not find detail table button')
 			return MonthAttendance(year=year, month=month, records=records)
 
-		# Extract data from detail table with JavaScript
-		# Note: Hilan has TWO sets of entry/exit inputs per row:
-		#   1. "דיווחי שעון" (Clock reports) - actual punch times, often empty
-		#   2. "דיווחי עובד" (Employee reports) - manually entered times
-		# We need to find the inputs with actual values, not the empty clock ones.
-		detail_data = self.page.evaluate(f"""
-			() => {{
-				const rows = document.querySelectorAll('tr[id*="_row_"]');
+		# Extract data from detail table with JavaScript.
+		# Hilan can render a day as split rows (date/special + values), so extraction is
+		# driven by stable row indexes embedded in control IDs instead of parent <tr> shape.
+		detail_data = self.page.evaluate(
+			r"""
+			() => {
+				const isVisible = (el) => {
+					const style = window.getComputedStyle(el);
+					const rect = el.getBoundingClientRect();
+					return (
+						style.display !== 'none' &&
+						style.visibility !== 'hidden' &&
+						rect.width > 0 &&
+						rect.height > 0
+					);
+				};
 
-				// Helper to find input with a valid time value from multiple matches
-				const findValidTimeInput = (inputs) => {{
-					for (const input of inputs) {{
-						const val = input?.value?.trim();
-						// Skip empty, placeholder, or clock-style empty values
-						if (val && val !== '' && val !== '--:--' && /^\\d{{1,2}}:\\d{{2}}$/.test(val)) {{
-							return input;
-						}}
-					}}
-					// Fallback: return last input (usually the employee reports one)
-					return inputs[inputs.length - 1] || null;
-				}};
+				const isValidTime = (value) => {
+					const normalized = (value || '').replace(/\u00a0/g, ' ').trim();
+					return normalized !== '' && normalized !== '--:--' && /^\d{1,2}:\d{2}$/.test(normalized);
+				};
 
-				return Array.from(rows).map(row => {{
-					const dateCell = row.querySelector('td[id*="ReportDate"]');
-					if (!dateCell) return null;
+				const extractTimeFromCell = (cell) => {
+					if (!cell) return '';
 
-					const dateMatch = dateCell.innerText.trim().match(/(\\d{{1,2}})\\/(\\d{{1,2}})/);
-					if (!dateMatch) return null;
+					const ovValue = (cell.getAttribute('ov') || '').replace(/\u00a0/g, ' ').trim();
+					if (isValidTime(ovValue)) return ovValue;
 
-					// Get ALL matching inputs, then find the one with a valid value
-					const entryInputs = row.querySelectorAll('{Selector.ENTRY_INPUT}');
-					const exitInputs = row.querySelectorAll('{Selector.EXIT_INPUT}');
-					const workTypeSelect = row.querySelector('{Selector.WORK_TYPE_SELECT}');
+					const inputs = Array.from(cell.querySelectorAll('input'));
+					const editableInputs = inputs.filter((input) => !input.disabled && !input.readOnly);
+					const orderedInputs = editableInputs.length > 0 ? editableInputs : inputs;
+					for (const input of orderedInputs) {
+						const inputValue = (input?.value || '').replace(/\u00a0/g, ' ').trim();
+						if (isValidTime(inputValue)) return inputValue;
+					}
 
-					const entryInput = findValidTimeInput(entryInputs);
-					const exitInput = findValidTimeInput(exitInputs);
+					return '';
+				};
 
-					return {{
-						day: parseInt(dateMatch[1]),
-						month: parseInt(dateMatch[2]),
-						entry: entryInput?.value || '',
-						exit: exitInput?.value || '',
-						workTypeCode: workTypeSelect?.value || ''
-					}};
-				}}).filter(Boolean);
-			}}
-		""")
+				const extractDateParts = (dateCell) => {
+					const sourceText = (dateCell.getAttribute('ov') || dateCell.innerText || '')
+						.replace(/\u00a0/g, ' ')
+						.trim();
+					const match = sourceText.match(/(\d{1,2})\/(\d{1,2})/);
+					if (!match) return null;
+					return {
+						day: Number.parseInt(match[1], 10),
+						month: Number.parseInt(match[2], 10),
+					};
+				};
+
+				const mergeRow = (existing, candidate) => {
+					if (!existing) return candidate;
+					return {
+						day: existing.day,
+						month: existing.month,
+						entry: existing.entry || candidate.entry,
+						exit: existing.exit || candidate.exit,
+						workTypeCode: existing.workTypeCode || candidate.workTypeCode,
+						missingEntry: Boolean(existing.missingEntry || candidate.missingEntry),
+						missingExit: Boolean(existing.missingExit || candidate.missingExit),
+					};
+				};
+
+				const byDateKey = new Map();
+				const dateCells = Array.from(
+					document.querySelectorAll('td[id*="_cellOf_ReportDate_row_"]')
+				).filter(isVisible);
+
+				for (const dateCell of dateCells) {
+					const idMatch = (dateCell.id || '').match(/_cellOf_ReportDate_row_(\d+)/);
+					if (!idMatch) continue;
+
+					const parsedDate = extractDateParts(dateCell);
+					if (!parsedDate) continue;
+					const rowIndex = idMatch[1];
+
+					const specialCell = document.querySelector(`td[id*="_special_row_${rowIndex}"]`);
+					const specialText = (specialCell?.innerText || '').replace(/\u00a0/g, ' ').trim();
+					const missingEntry = specialText.includes('חסרה כניסה');
+					const missingExit = specialText.includes('חסרה יציאה');
+
+					const entryCell = document.querySelector(
+						`td[id*="_cellOf_ManualEntry_EmployeeReports_row_${rowIndex}_0"]`
+					);
+					const exitCell = document.querySelector(
+						`td[id*="_cellOf_ManualExit_EmployeeReports_row_${rowIndex}_0"]`
+					);
+					const workTypeSelect = document.querySelector(
+						`td[id*="_cellOf_Symbol.SymbolId_EmployeeReports_row_${rowIndex}_0"] select`
+					);
+
+					let entry = extractTimeFromCell(entryCell);
+					let exit = extractTimeFromCell(exitCell);
+
+					const textTimeSource = [specialText, entryCell?.innerText || '', exitCell?.innerText || '']
+						.join(' ')
+						.replace(/\u00a0/g, ' ');
+					const textTimes = (textTimeSource.match(/\b\d{1,2}:\d{2}\b/g) || []).filter(isValidTime);
+					if (!entry && !exit && textTimes.length === 1) {
+						if (missingEntry) {
+							exit = textTimes[0];
+						} else if (missingExit) {
+							entry = textTimes[0];
+						}
+					}
+
+					const candidate = {
+						day: parsedDate.day,
+						month: parsedDate.month,
+						entry,
+						exit,
+						workTypeCode: workTypeSelect?.value || '',
+						missingEntry,
+						missingExit,
+					};
+
+					const key = `${candidate.day}/${candidate.month}`;
+					byDateKey.set(key, mergeRow(byDateKey.get(key), candidate));
+				}
+
+				return Array.from(byDateKey.values());
+			}
+			"""
+		)
 
 		# Map records by (day, month) for fast lookup
 		record_map = {(r.date.day, r.date.month): r for r in records}
 
-		logger.debug('Found %d rows in detail table...', len(detail_data))
+		selected_count = int(selected_info.get('count', 0) or 0)
+		day_keys = [str(k) for k in selected_info.get('dayKeys', []) if str(k)]
+		if selected_count > len(detail_data) and day_keys:
+			clear_btn = self.page.locator(f'input[value="{Buttons.CLEAR}"]')
+			if clear_btn.count() > 0 and clear_btn.is_visible():
+				clear_btn.first.click()
+				self.page.wait_for_timeout(Timing.WAIT_AFTER_CLEAR)
+
+			fallback_data: list[dict[str, Any]] = []
+			for day_key in day_keys:
+				if clear_btn.count() > 0 and clear_btn.is_visible():
+					clear_btn.first.click()
+					self.page.wait_for_timeout(Timing.WAIT_AFTER_CLEAR)
+
+				click_result = self.page.evaluate(
+					"""
+					(dayKey) => {
+						const isVisible = (el) => {
+							const style = window.getComputedStyle(el);
+							const rect = el.getBoundingClientRect();
+							return (
+								style.display !== 'none' &&
+								style.visibility !== 'hidden' &&
+								rect.width > 0 &&
+								rect.height > 0
+							);
+						};
+
+						const cells = Array.from(document.querySelectorAll(`td[days="${dayKey}"]`));
+						const cell =
+							cells.find((c) => c.onclick && isVisible(c)) ||
+							cells.find((c) => c.onclick) ||
+							cells[0];
+						if (!cell) return { clicked: false, clickedDay: null };
+						cell.click();
+						const ariaDay = (cell.getAttribute('aria-label') || '').trim();
+						const textDay = (cell.querySelector('.dTS')?.textContent || '').trim();
+						const dayValue = Number(ariaDay || textDay || 0);
+						return {
+							clicked: true,
+							clickedDay: Number.isFinite(dayValue) && dayValue > 0 ? dayValue : null,
+						};
+					}
+					""",
+					day_key,
+				)
+				if not click_result or not click_result.get('clicked'):
+					continue
+				self.page.wait_for_timeout(Timing.WAIT_AFTER_CLICK)
+
+				selected_days_btn = self.page.locator(f'input[value="{Buttons.SELECTED_DAYS}"]')
+				if selected_days_btn.count() > 0:
+					selected_days_btn.first.click()
+					self.page.wait_for_timeout(Timing.WAIT_FOR_TABLE_LOAD)
+					self.wait_for_load()
+				else:
+					continue
+
+				row_data = self.page.evaluate(
+					r"""
+					(params) => {
+						const clickedDay = Number(params.clickedDay || 0);
+						const isVisible = (el) => {
+							const style = window.getComputedStyle(el);
+							const rect = el.getBoundingClientRect();
+							return (
+								style.display !== 'none' &&
+								style.visibility !== 'hidden' &&
+								rect.width > 0 &&
+								rect.height > 0
+							);
+						};
+
+						const isValidTime = (value) => {
+							const normalized = (value || '').replace(/\u00a0/g, ' ').trim();
+							return normalized !== '' && normalized !== '--:--' && /^\d{1,2}:\d{2}$/.test(normalized);
+						};
+
+						const extractTimeFromCell = (cell) => {
+							if (!cell) return '';
+
+							const ovValue = (cell.getAttribute('ov') || '').replace(/\u00a0/g, ' ').trim();
+							if (isValidTime(ovValue)) return ovValue;
+
+							const inputs = Array.from(cell.querySelectorAll('input'));
+							const editableInputs = inputs.filter((input) => !input.disabled && !input.readOnly);
+							const orderedInputs = editableInputs.length > 0 ? editableInputs : inputs;
+							for (const input of orderedInputs) {
+								const inputValue = (input?.value || '').replace(/\u00a0/g, ' ').trim();
+								if (isValidTime(inputValue)) return inputValue;
+							}
+
+							return '';
+						};
+
+						const dateCells = Array.from(
+							document.querySelectorAll('td[id*="_cellOf_ReportDate_row_"]')
+						).filter(isVisible);
+						if (dateCells.length === 0) return null;
+
+						const parsedRows = [];
+						for (const dateCell of dateCells) {
+							const idMatch = (dateCell.id || '').match(/_cellOf_ReportDate_row_(\d+)/);
+							if (!idMatch) continue;
+							const rowIndex = idMatch[1];
+
+							const sourceText = (dateCell.getAttribute('ov') || dateCell.innerText || '')
+								.replace(/\u00a0/g, ' ')
+								.trim();
+							const dateMatch = sourceText.match(/(\d{1,2})\/(\d{1,2})/);
+							if (!dateMatch) continue;
+
+							const specialCell = document.querySelector(`td[id*="_special_row_${rowIndex}"]`);
+							const specialText = (specialCell?.innerText || '').replace(/\u00a0/g, ' ').trim();
+							const missingEntry = specialText.includes('חסרה כניסה');
+							const missingExit = specialText.includes('חסרה יציאה');
+
+							const entryCell = document.querySelector(
+								`td[id*="_cellOf_ManualEntry_EmployeeReports_row_${rowIndex}_0"]`
+							);
+							const exitCell = document.querySelector(
+								`td[id*="_cellOf_ManualExit_EmployeeReports_row_${rowIndex}_0"]`
+							);
+							const workTypeSelect = document.querySelector(
+								`td[id*="_cellOf_Symbol.SymbolId_EmployeeReports_row_${rowIndex}_0"] select`
+							);
+
+							let entry = extractTimeFromCell(entryCell);
+							let exit = extractTimeFromCell(exitCell);
+							const textTimeSource = [specialText, entryCell?.innerText || '', exitCell?.innerText || '']
+								.join(' ')
+								.replace(/\u00a0/g, ' ');
+							const textTimes = (textTimeSource.match(/\b\d{1,2}:\d{2}\b/g) || []).filter(isValidTime);
+							if (!entry && !exit && textTimes.length === 1) {
+								if (missingEntry) {
+									exit = textTimes[0];
+								} else if (missingExit) {
+									entry = textTimes[0];
+								}
+							}
+
+							parsedRows.push({
+								day: Number.parseInt(dateMatch[1], 10),
+								month: Number.parseInt(dateMatch[2], 10),
+								entry,
+								exit,
+								workTypeCode: workTypeSelect?.value || '',
+								missingEntry,
+								missingExit,
+							});
+						}
+
+						if (parsedRows.length === 0) return null;
+						if (clickedDay > 0) {
+							return parsedRows.find((row) => row.day === clickedDay) || null;
+						}
+						return parsedRows[0];
+					}
+					""",
+					{'clickedDay': click_result.get('clickedDay')},
+				)
+				if row_data:
+					fallback_data.append(row_data)
+
+			if fallback_data:
+				by_date = {(int(r['day']), int(r['month'])): dict(r) for r in detail_data}
+				for row in fallback_data:
+					day = row.get('day')
+					month_value = row.get('month')
+					if not isinstance(day, int) or not isinstance(month_value, int):
+						continue
+					key = (day, month_value)
+					existing = by_date.get(
+						key,
+						{
+							'day': day,
+							'month': month_value,
+							'entry': '',
+							'exit': '',
+							'workTypeCode': '',
+							'missingEntry': False,
+							'missingExit': False,
+						},
+					)
+					for field in ('entry', 'exit', 'workTypeCode'):
+						if row.get(field):
+							existing[field] = row[field]
+					existing['missingEntry'] = bool(existing.get('missingEntry')) or bool(
+						row.get('missingEntry')
+					)
+					existing['missingExit'] = bool(existing.get('missingExit')) or bool(
+						row.get('missingExit')
+					)
+					by_date[key] = existing
+				detail_data = list(by_date.values())
 
 		# Update records with detail data
 		for data in detail_data:
@@ -333,7 +653,7 @@ class CalendarPage(BasePage):
 
 	def fill_batch(
 		self,
-		records_to_fill: list[tuple[date, time, time, WorkType]],
+		records_to_fill: list[tuple[date, Optional[time], Optional[time], WorkType]],
 		dry_run: bool = False,
 	) -> tuple[int, int]:
 		"""Fill attendance for multiple days in one batch operation.
@@ -358,12 +678,14 @@ class CalendarPage(BasePage):
 			for record_date, entry_time, exit_time, work_type in records_to_fill:
 				day_str = record_date.strftime('%d/%m/%Y')
 				work_label = work_type.label
+				entry_str = entry_time.strftime('%H:%M') if entry_time else '(keep existing)'
+				exit_str = exit_time.strftime('%H:%M') if exit_time else '(keep existing)'
 				logger.info(
 					'📝 %s: %s (%s-%s) (dry run)',
 					day_str,
 					work_label,
-					entry_time.strftime('%H:%M'),
-					exit_time.strftime('%H:%M'),
+					entry_str,
+					exit_str,
 				)
 			return len(records_to_fill), 0
 
@@ -451,75 +773,74 @@ class CalendarPage(BasePage):
 			for record_date, entry_time, exit_time, work_type in records_to_fill:
 				if not work_type.hilan_code:
 					continue
-				day_key = f'{record_date.day:02d}/{record_date.month:02d}'
-				fill_map[day_key] = {
-					'entry': entry_time.strftime('%H:%M'),
-					'exit': exit_time.strftime('%H:%M'),
-					'workCode': work_type.hilan_code,
-				}
+					day_key = f'{record_date.day:02d}/{record_date.month:02d}'
+					fill_map[day_key] = {
+						'entry': entry_time.strftime('%H:%M') if entry_time else None,
+						'exit': exit_time.strftime('%H:%M') if exit_time else None,
+						'workCode': work_type.hilan_code,
+					}
 
 			result = self.page.evaluate(
 				rf"""
 				(fillMap) => {{
-					const entryInputs = document.querySelectorAll('{Selector.ENTRY_INPUT}');
-					const exitInputs = document.querySelectorAll('{Selector.EXIT_INPUT}');
-					const symbolSelects = document.querySelectorAll('{Selector.WORK_TYPE_SELECT}');
-
-					if (entryInputs.length === 0) {{
-						return {{ success: false, error: 'No entry inputs found', filled: 0 }};
+					const rows = document.querySelectorAll('tr[id*="_row_"]');
+					if (rows.length === 0) {{
+						return {{ success: false, error: 'No detail rows found', filled: 0 }};
 					}}
+
+					const pickEditable = (elements) => {{
+						const all = Array.from(elements);
+						if (all.length === 0) return null;
+
+						const editable = all.filter((el) => !el.disabled && !el.readOnly);
+						return editable.length > 0 ? editable[editable.length - 1] : all[all.length - 1];
+					}};
+
+					const normalizeDate = (dateText) => {{
+						const match = dateText.match(/^(\d{{1,2}})\/(\d{{1,2}})$/);
+						if (!match) return null;
+						return match[1].padStart(2, '0') + '/' + match[2].padStart(2, '0');
+					}};
 
 					let filled = 0;
 					const errors = [];
-
-					// First, gather all ReportDate cells from the main grid
-					const allReportDateCells = document.querySelectorAll('[id*="ReportDate_row_"]');
-					const dates = [];
-
-					for (const cell of allReportDateCells) {{
-						const text = cell.textContent?.trim();
-						if (text && /^\d{{1,2}}\/\d{{1,2}}/.test(text)) {{
-							const dateText = text.split(' ')[0]; // Get "19/12" part
-							dates.push(dateText);
-						}}
-					}}
-
-					// Now fill inputs by index - assume inputs are in same order as dates
-					for (let i = 0; i < entryInputs.length; i++) {{
+					for (const [i, row] of Array.from(rows).entries()) {{
 						try {{
-							// Get the date for this row by index
-							const dateText = dates[i];
-
+							const dateCell = row.querySelector('td[id*="ReportDate"]');
+							const dateRaw = dateCell?.textContent?.trim()?.split(' ')[0] || '';
+							const dateText = normalizeDate(dateRaw);
 							if (!dateText) {{
-								errors.push('Row ' + i + ': No date found at this index (have ' + dates.length + ' dates total)');
+								errors.push('Row ' + i + ': invalid date text "' + dateRaw + '"');
 								continue;
 							}}
 
-							// Check if we have fill data for this date
 							const fillData = fillMap[dateText];
 							if (!fillData) {{
-								// This day wasn't in our fill list, skip it silently
 								continue;
 							}}
 
-							// Fill entry time
-							if (entryInputs[i]) {{
-								entryInputs[i].value = fillData.entry;
-								entryInputs[i].dispatchEvent(new Event('change', {{ bubbles: true }}));
-								entryInputs[i].dispatchEvent(new Event('blur', {{ bubbles: true }}));
+							const entryInput = pickEditable(row.querySelectorAll('{Selector.ENTRY_INPUT}'));
+							const exitInput = pickEditable(row.querySelectorAll('{Selector.EXIT_INPUT}'));
+							const symbolSelect = pickEditable(row.querySelectorAll('{Selector.WORK_TYPE_SELECT}'));
+
+							// Fill entry time (skip for partial days)
+							if (entryInput && fillData.entry !== null) {{
+								entryInput.value = fillData.entry;
+								entryInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+								entryInput.dispatchEvent(new Event('blur', {{ bubbles: true }}));
 							}}
 
-							// Fill exit time
-							if (exitInputs[i]) {{
-								exitInputs[i].value = fillData.exit;
-								exitInputs[i].dispatchEvent(new Event('change', {{ bubbles: true }}));
-								exitInputs[i].dispatchEvent(new Event('blur', {{ bubbles: true }}));
+							// Fill exit time (skip for partial days)
+							if (exitInput && fillData.exit !== null) {{
+								exitInput.value = fillData.exit;
+								exitInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+								exitInput.dispatchEvent(new Event('blur', {{ bubbles: true }}));
 							}}
 
 							// Set work type
-							if (symbolSelects[i]) {{
-								symbolSelects[i].value = fillData.workCode;
-								symbolSelects[i].dispatchEvent(new Event('change', {{ bubbles: true }}));
+							if (symbolSelect) {{
+								symbolSelect.value = fillData.workCode;
+								symbolSelect.dispatchEvent(new Event('change', {{ bubbles: true }}));
 							}}
 
 							filled++;
@@ -531,7 +852,7 @@ class CalendarPage(BasePage):
 					return {{
 						success: filled > 0,
 						filled: filled,
-						totalRows: entryInputs.length,
+						totalRows: rows.length,
 						errors: errors
 					}};
 				}}

@@ -340,10 +340,8 @@ def status(ctx: click.Context, month: Optional[int], year: Optional[int]) -> Non
 			r for r in attendance.records if r.date.weekday() in cfg.pattern.work_days
 		]
 		complete = len([r for r in work_day_records if r.is_complete])
-		empty = len([r for r in work_day_records if r.needs_filling])
-		partial = len(
-			[r for r in work_day_records if r.has_existing_entry and not r.has_existing_exit]
-		)
+		partial = len([r for r in work_day_records if r.has_existing_entry != r.has_existing_exit])
+		empty = len([r for r in work_day_records if r.is_empty and not r.note])
 
 		logger.info('Summary:')
 		logger.success('  ✓ Filled: %d', complete)

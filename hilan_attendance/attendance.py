@@ -53,11 +53,13 @@ def fill_attendance(
 			logger.debug('⏭ %s (%s)', record.date.strftime('%d/%m'), translate_note(record.note))
 			continue
 
-		# Get work type for this day
-		work_type = pattern.get_work_type(record.date.weekday()) or WorkType.OFFICE
-
 		# Add to batch
-		records_to_fill.append((record.date, pattern.entry_time, pattern.exit_time, work_type))
+		records_to_fill.append((
+			record.date,
+			record.entry_time if record.has_existing_entry else pattern.entry_time,
+			record.exit_time if record.has_existing_exit else pattern.exit_time,
+			pattern.get_work_type(record.date.weekday()) or WorkType.OFFICE
+		))
 
 	# Fill all records in one efficient batch operation
 	if records_to_fill:

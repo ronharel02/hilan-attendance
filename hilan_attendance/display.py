@@ -31,10 +31,11 @@ def format_record_current_state(record: AttendanceRecord) -> str:
 		type_label = get_work_type_label(record.work_type)
 		times = f'{record.entry_time.strftime("%H:%M")}-{record.exit_time.strftime("%H:%M")}'
 		return f'[green]{type_label} ({times})[/green]'
-	elif record.has_existing_entry and record.entry_time:
+	elif record.has_existing_entry or record.has_existing_exit:
 		type_label = get_work_type_label(record.work_type)
+		entry_str = record.entry_time.strftime('%H:%M') if record.entry_time else '?'
 		exit_str = record.exit_time.strftime('%H:%M') if record.exit_time else '?'
-		times = f'{record.entry_time.strftime("%H:%M")}-{exit_str}'
+		times = f'{entry_str}-{exit_str}'
 		return f'[yellow]{type_label} ({times})[/yellow]'
 	elif record.note:
 		return f'[yellow]{translate_note(record.note)}[/yellow]'
@@ -76,7 +77,7 @@ def display_current_status(attendance: MonthAttendance, pattern: AttendancePatte
 		# Status
 		if record.is_complete:
 			status = '[green]✓ Filled[/green]'
-		elif record.has_existing_entry and not record.has_existing_exit:
+		elif record.has_existing_entry != record.has_existing_exit:
 			status = '[yellow]⚡ Partial[/yellow]'
 		elif record.note:
 			status = f'[yellow]📋 {translate_note(record.note)}[/yellow]'
@@ -165,7 +166,10 @@ def display_fill_plan(
 		elif record.has_existing_entry and not record.has_existing_exit:
 			action = f'[cyan]→ Add exit: {pattern.exit_time.strftime("%H:%M")}[/cyan]'
 			row_style = None
-		elif record.is_empty or not record.has_existing_entry:
+		elif record.has_existing_exit and not record.has_existing_entry:
+			action = f'[cyan]→ Add entry: {pattern.entry_time.strftime("%H:%M")}[/cyan]'
+			row_style = None
+		elif record.is_empty:
 			times = f'{pattern.entry_time.strftime("%H:%M")}-{pattern.exit_time.strftime("%H:%M")}'
 			action = f'[green]→ {day_type_label} ({times})[/green]'
 			row_style = 'bold'
