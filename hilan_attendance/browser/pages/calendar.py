@@ -4,12 +4,13 @@ import calendar as cal
 import re
 from datetime import date, time
 from enum import IntEnum
-from typing import Any, Optional
+from typing import Optional
 
 from playwright.sync_api import Locator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from ... import logger
-from ...models import AttendanceRecord, MonthAttendance, WorkType
+from ...models import AttendanceRecord, FillInstruction, MonthAttendance, WorkType
 from ...vocabulary import AriaLabels, Buttons, Months, StatusNotes
 from .base import BasePage
 
@@ -71,6 +72,69 @@ class Timing(IntEnum):
 	WAIT_AFTER_SAVE = 500
 	WAIT_FOR_DROPDOWN = 300
 	WAIT_FOR_DROPDOWN_OPEN = 100
+
+
+class _SelectedInfo(BaseModel):
+	"""Parsed payload for calendar selection summary."""
+
+	model_config = ConfigDict(extra='ignore')
+
+	count: int = 0
+	daysSample: list[str] = Field(default_factory=list)
+	dayKeys: list[str] = Field(default_factory=list)
+
+
+class _DetailRow(BaseModel):
+	"""Parsed payload for a day row in the detail table."""
+
+	model_config = ConfigDict(extra='ignore')
+
+	day: int
+	month: int
+	entry: str = ''
+	exit: str = ''
+	workTypeCode: str = ''
+	missingEntry: bool = False
+	missingExit: bool = False
+
+
+class _ClickResult(BaseModel):
+	"""Parsed payload for a click attempt in the calendar grid."""
+
+	model_config = ConfigDict(extra='ignore')
+
+	clicked: bool = False
+	clickedDay: Optional[int] = None
+
+
+class _ClickedDaysResult(BaseModel):
+	"""Parsed payload for selected and failed day clicks."""
+
+	model_config = ConfigDict(extra='ignore')
+
+	clickedDays: list[int] = Field(default_factory=list)
+	failedDays: list[int] = Field(default_factory=list)
+
+
+class _FillBatchResult(BaseModel):
+	"""Parsed payload for batch fill JS result."""
+
+	model_config = ConfigDict(extra='ignore')
+
+	success: bool
+	filled: int = 0
+	totalRows: int = 0
+	matched: int = 0
+	errors: list[str] = Field(default_factory=list)
+	error: Optional[str] = None
+
+
+SELECTED_INFO_ADAPTER = TypeAdapter(_SelectedInfo)
+DETAIL_ROW_ADAPTER = TypeAdapter(_DetailRow)
+DETAIL_ROWS_ADAPTER = TypeAdapter(list[_DetailRow])
+CLICK_RESULT_ADAPTER = TypeAdapter(_ClickResult)
+CLICKED_DAYS_ADAPTER = TypeAdapter(_ClickedDaysResult)
+FILL_BATCH_RESULT_ADAPTER = TypeAdapter(_FillBatchResult)
 
 
 class CalendarPage(BasePage):
@@ -238,7 +302,7 @@ class CalendarPage(BasePage):
 			logger.warning('No days found in calendar')
 			return MonthAttendance(year=year, month=month, records=[])
 
-		selected_info = self.page.evaluate(
+		selected_info_raw = self.page.evaluate(
 			r"""
 			() => {
 				const isVisible = (el) => {
@@ -290,6 +354,11 @@ class CalendarPage(BasePage):
 			}
 			"""
 		)
+		try:
+			selected_info = SELECTED_INFO_ADAPTER.validate_python(selected_info_raw)
+		except ValidationError as e:
+			logger.warning('Unexpected selected-info payload: %s', e)
+			selected_info = _SelectedInfo()
 
 		# Click "ימים נבחרים" to load detail table
 		btn = self.page.locator(f'text={Buttons.SELECTED_DAYS}')
@@ -304,7 +373,7 @@ class CalendarPage(BasePage):
 		# Extract data from detail table with JavaScript.
 		# Hilan can render a day as split rows (date/special + values), so extraction is
 		# driven by stable row indexes embedded in control IDs instead of parent <tr> shape.
-		detail_data = self.page.evaluate(
+		detail_data_raw = self.page.evaluate(
 			r"""
 			() => {
 				const isVisible = (el) => {
@@ -426,25 +495,30 @@ class CalendarPage(BasePage):
 			}
 			"""
 		)
+		try:
+			detail_rows = DETAIL_ROWS_ADAPTER.validate_python(detail_data_raw)
+		except ValidationError as e:
+			logger.warning('Unexpected detail-table payload: %s', e)
+			detail_rows = []
 
 		# Map records by (day, month) for fast lookup
 		record_map = {(r.date.day, r.date.month): r for r in records}
 
-		selected_count = int(selected_info.get('count', 0) or 0)
-		day_keys = [str(k) for k in selected_info.get('dayKeys', []) if str(k)]
-		if selected_count > len(detail_data) and day_keys:
+		selected_count = selected_info.count
+		day_keys = [day_key for day_key in selected_info.dayKeys if day_key]
+		if selected_count > len(detail_rows) and day_keys:
 			clear_btn = self.page.locator(f'input[value="{Buttons.CLEAR}"]')
 			if clear_btn.count() > 0 and clear_btn.is_visible():
 				clear_btn.first.click()
 				self.page.wait_for_timeout(Timing.WAIT_AFTER_CLEAR)
 
-			fallback_data: list[dict[str, Any]] = []
+			fallback_data: list[_DetailRow] = []
 			for day_key in day_keys:
 				if clear_btn.count() > 0 and clear_btn.is_visible():
 					clear_btn.first.click()
 					self.page.wait_for_timeout(Timing.WAIT_AFTER_CLEAR)
 
-				click_result = self.page.evaluate(
+				click_result_raw = self.page.evaluate(
 					"""
 					(dayKey) => {
 						const isVisible = (el) => {
@@ -476,7 +550,15 @@ class CalendarPage(BasePage):
 					""",
 					day_key,
 				)
-				if not click_result or not click_result.get('clicked'):
+				try:
+					click_result = CLICK_RESULT_ADAPTER.validate_python(click_result_raw)
+				except ValidationError as e:
+					logger.debug(
+						'Skipping invalid click result payload for day_key=%s: %s', day_key, e
+					)
+					continue
+
+				if not click_result.clicked:
 					continue
 				self.page.wait_for_timeout(Timing.WAIT_AFTER_CLICK)
 
@@ -488,7 +570,7 @@ class CalendarPage(BasePage):
 				else:
 					continue
 
-				row_data = self.page.evaluate(
+				row_data_raw = self.page.evaluate(
 					r"""
 					(params) => {
 						const clickedDay = Number(params.clickedDay || 0);
@@ -589,56 +671,50 @@ class CalendarPage(BasePage):
 						return parsedRows[0];
 					}
 					""",
-					{'clickedDay': click_result.get('clickedDay')},
+					{'clickedDay': click_result.clickedDay},
 				)
-				if row_data:
-					fallback_data.append(row_data)
+				if row_data_raw:
+					try:
+						fallback_data.append(DETAIL_ROW_ADAPTER.validate_python(row_data_raw))
+					except ValidationError as e:
+						logger.debug(
+							'Skipping invalid fallback row payload for day_key=%s: %s', day_key, e
+						)
 
 			if fallback_data:
-				by_date = {(int(r['day']), int(r['month'])): dict(r) for r in detail_data}
+				by_date = {(r.day, r.month): r for r in detail_rows}
 				for row in fallback_data:
-					day = row.get('day')
-					month_value = row.get('month')
-					if not isinstance(day, int) or not isinstance(month_value, int):
-						continue
-					key = (day, month_value)
+					key = (row.day, row.month)
 					existing = by_date.get(
 						key,
-						{
-							'day': day,
-							'month': month_value,
-							'entry': '',
-							'exit': '',
-							'workTypeCode': '',
-							'missingEntry': False,
-							'missingExit': False,
-						},
+						_DetailRow(day=row.day, month=row.month),
 					)
-					for field in ('entry', 'exit', 'workTypeCode'):
-						if row.get(field):
-							existing[field] = row[field]
-					existing['missingEntry'] = bool(existing.get('missingEntry')) or bool(
-						row.get('missingEntry')
-					)
-					existing['missingExit'] = bool(existing.get('missingExit')) or bool(
-						row.get('missingExit')
-					)
+
+					if row.entry:
+						existing.entry = row.entry
+					if row.exit:
+						existing.exit = row.exit
+					if row.workTypeCode:
+						existing.workTypeCode = row.workTypeCode
+
+					existing.missingEntry = existing.missingEntry or row.missingEntry
+					existing.missingExit = existing.missingExit or row.missingExit
 					by_date[key] = existing
-				detail_data = list(by_date.values())
+				detail_rows = list(by_date.values())
 
 		# Update records with detail data
-		for data in detail_data:
-			if not (record := record_map.get((data['day'], data['month']))):
+		for data in detail_rows:
+			if not (record := record_map.get((data.day, data.month))):
 				continue
 
-			if data.get('entry') and (parsed_entry := parse_time_string(data['entry'])):
+			if data.entry and (parsed_entry := parse_time_string(data.entry)):
 				record.entry_time = parsed_entry
 
-			if data.get('exit') and (parsed_exit := parse_time_string(data['exit'])):
+			if data.exit and (parsed_exit := parse_time_string(data.exit)):
 				record.exit_time = parsed_exit
 
-			if data.get('workTypeCode'):
-				record.work_type = WorkType.from_hilan_code(data['workTypeCode'])
+			if data.workTypeCode:
+				record.work_type = WorkType.from_hilan_code(data.workTypeCode)
 
 		records.sort(key=lambda r: r.date)
 		if records:
@@ -653,7 +729,7 @@ class CalendarPage(BasePage):
 
 	def fill_batch(
 		self,
-		records_to_fill: list[tuple[date, Optional[time], Optional[time], WorkType]],
+		records_to_fill: list[FillInstruction],
 		dry_run: bool = False,
 	) -> tuple[int, int]:
 		"""Fill attendance for multiple days in one batch operation.
@@ -663,7 +739,7 @@ class CalendarPage(BasePage):
 		We do: clear -> click ALL days -> select once -> fill all -> save once
 
 		Args:
-			records_to_fill: List of (date, entry_time, exit_time, work_type) tuples.
+			records_to_fill: List of fill instructions.
 			dry_run: If True, show what would be done without actually doing it.
 
 		Returns:
@@ -675,11 +751,19 @@ class CalendarPage(BasePage):
 		logger.info('📦 Batch filling %d days...', len(records_to_fill))
 
 		if dry_run:
-			for record_date, entry_time, exit_time, work_type in records_to_fill:
-				day_str = record_date.strftime('%d/%m/%Y')
-				work_label = work_type.label
-				entry_str = entry_time.strftime('%H:%M') if entry_time else '(keep existing)'
-				exit_str = exit_time.strftime('%H:%M') if exit_time else '(keep existing)'
+			for instruction in records_to_fill:
+				day_str = instruction.date.strftime('%d/%m/%Y')
+				work_label = instruction.type.label
+				entry_str = (
+					instruction.entry_time.strftime('%H:%M')
+					if instruction.entry_time
+					else '(keep existing)'
+				)
+				exit_str = (
+					instruction.exit_time.strftime('%H:%M')
+					if instruction.exit_time
+					else '(keep existing)'
+				)
 				logger.info(
 					'📝 %s: %s (%s-%s) (dry run)',
 					day_str,
@@ -700,10 +784,10 @@ class CalendarPage(BasePage):
 			# Step 2: Click all days in the calendar
 			logger.debug('🖱️  Selecting %d days...', len(records_to_fill))
 			day_numbers = list(
-				dict.fromkeys(record_date.day for record_date, _, _, _ in records_to_fill)
+				dict.fromkeys(instruction.date.day for instruction in records_to_fill)
 			)
 
-			clicked = self.page.evaluate(
+			clicked_raw = self.page.evaluate(
 				f"""
 				(dayNumbers) => {{
 					const isVisible = (el) => {{
@@ -741,18 +825,23 @@ class CalendarPage(BasePage):
 
 					return {{ clickedDays, failedDays }};
 				}}
-			""",
+				""",
 				day_numbers,
 			)
+			try:
+				clicked = CLICKED_DAYS_ADAPTER.validate_python(clicked_raw)
+			except ValidationError as e:
+				logger.error('Unexpected clicked-days payload: %s', e)
+				return 0, len(records_to_fill)
 
-			if clicked.get('failedDays'):
-				logger.warning('Could not click days: %s', clicked['failedDays'])
+			if clicked.failedDays:
+				logger.warning('Could not click days: %s', clicked.failedDays)
 
-			if not clicked.get('clickedDays'):
+			if not clicked.clickedDays:
 				logger.error('Failed to select any days')
 				return 0, len(records_to_fill)
 
-			logger.debug('✓ Selected %d days', len(clicked['clickedDays']))
+			logger.debug('✓ Selected %d days', len(clicked.clickedDays))
 			self.page.wait_for_timeout(Timing.WAIT_AFTER_CLICK)
 
 			# Step 3: Click "Selected Days" button to load all selected days into the table
@@ -814,18 +903,22 @@ class CalendarPage(BasePage):
 			logger.debug('✍️  Filling all rows...')
 
 			# Build mapping of day -> fill data
-			fill_map = {}
-			for record_date, entry_time, exit_time, work_type in records_to_fill:
-				if not work_type.hilan_code:
+			fill_map: dict[str, dict[str, Optional[str]]] = {}
+			for instruction in records_to_fill:
+				if not instruction.type.hilan_code:
 					continue
-				day_key = f'{record_date.day:02d}/{record_date.month:02d}'
+				day_key = f'{instruction.date.day:02d}/{instruction.date.month:02d}'
 				fill_map[day_key] = {
-					'entry': entry_time.strftime('%H:%M') if entry_time else None,
-					'exit': exit_time.strftime('%H:%M') if exit_time else None,
-					'workCode': work_type.hilan_code,
+					'entry': instruction.entry_time.strftime('%H:%M')
+					if instruction.entry_time
+					else None,
+					'exit': instruction.exit_time.strftime('%H:%M')
+					if instruction.exit_time
+					else None,
+					'workCode': instruction.type.hilan_code,
 				}
 
-			result = self.page.evaluate(
+			result_raw = self.page.evaluate(
 				r"""
 				(fillMap) => {{
 					const pickEditable = (elements) => {{
@@ -928,26 +1021,31 @@ class CalendarPage(BasePage):
 						errors: errors
 					}};
 				}}
-			""",
+				""",
 				fill_map,
 			)
+			try:
+				result = FILL_BATCH_RESULT_ADAPTER.validate_python(result_raw)
+			except ValidationError as e:
+				logger.error('Unexpected fill result payload: %s', e)
+				return 0, len(records_to_fill)
 
-			if not result.get('success'):
-				errors = result.get('errors') or []
-				extra = f' matched={result.get("matched", 0)} rows={result.get("totalRows", 0)}'
+			if not result.success:
+				errors = result.errors
+				extra = f' matched={result.matched} rows={result.totalRows}'
 				if errors:
 					extra += f' first_error={errors[0]}'
 				logger.error(
-					'Failed to fill any rows: %s%s', result.get('error', 'Unknown error'), extra
+					'Failed to fill any rows: %s%s', result.error or 'Unknown error', extra
 				)
 				return 0, len(records_to_fill)
 
-			filled_count = result.get('filled', 0)
-			total_rows = result.get('totalRows', 0)
+			filled_count = result.filled
+			total_rows = result.totalRows
 			logger.debug('✓ Filled %d/%d rows', filled_count, total_rows)
 
-			if result.get('errors') and len(result['errors']) > 0:
-				logger.warning('%d warnings', len(result['errors']))
+			if result.errors:
+				logger.warning('%d warnings', len(result.errors))
 
 			self.page.wait_for_timeout(Timing.WAIT_AFTER_FILL)
 

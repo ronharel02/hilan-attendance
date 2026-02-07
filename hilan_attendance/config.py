@@ -88,7 +88,7 @@ def create_config_interactive() -> Config:
 
 	# Work days with per-day work type
 	logger.info('\nWork Days:')
-	logger.info('For each day, enter: office, home, abroad, meeting, or skip\n')
+	logger.info('For each day, enter: office, home, abroad, or skip\n')
 
 	# Default work days (Israeli work week: Sunday-Thursday)
 	default_work_days = {
@@ -99,20 +99,22 @@ def create_config_interactive() -> Config:
 		Weekdays.THURSDAY,
 	}
 
-	days = {}
+	days: dict[Weekdays, WorkType] = {}
+	allowed_work_types = ', '.join(work_type.value for work_type in WorkType)
 	for day in Weekdays._members():
 		default_type = WorkType.OFFICE if day in default_work_days else WorkType.SKIP
-		response = Prompt.ask(
-			f'[yellow]{day.value.capitalize()}[/yellow]', default=default_type.value
-		)
-
-		try:
-			work_type = WorkType(response.lower())
-		except ValueError:
-			work_type = WorkType.SKIP if response.lower() == 'skip' else WorkType.OFFICE
+		while True:
+			response = Prompt.ask(
+				f'[yellow]{day.value.capitalize()}[/yellow]', default=default_type.value
+			)
+			try:
+				work_type = WorkType(response.strip().lower())
+				break
+			except ValueError:
+				logger.error("Invalid work type '%s'. Use one of: %s", response, allowed_work_types)
 
 		if work_type != WorkType.SKIP:
-			days[day.value] = work_type
+			days[day] = work_type
 
 	# Pay period start day
 	logger.info('\nPay Period:')

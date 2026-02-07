@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import date, time
 from typing import TYPE_CHECKING, Optional
 
 from .. import logger
@@ -10,7 +9,7 @@ from .pages import CalendarPage, HomePage, LoginPage
 from .session import BrowserSession
 
 if TYPE_CHECKING:
-	from ..models import Config, MonthAttendance, WorkType
+	from ..models import Config, FillInstruction, MonthAttendance
 
 
 class HilanBrowser:
@@ -114,13 +113,13 @@ class HilanBrowser:
 
 	def fill_batch_attendance(
 		self,
-		records_to_fill: list[tuple[date, Optional[time], Optional[time], WorkType]],
+		records_to_fill: list[FillInstruction],
 		dry_run: bool = False,
 	) -> tuple[int, int]:
 		"""Fill attendance for multiple days in one batch.
 
 		Args:
-			records_to_fill: List of (date, entry_time, exit_time, work_type) tuples.
+			records_to_fill: List of fill instructions.
 			dry_run: If True, show what would be done without actually doing it.
 
 		Returns:

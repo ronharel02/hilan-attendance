@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, time
 from enum import Enum
 from typing import Optional
@@ -11,7 +12,6 @@ from pydantic import (
 	Field,
 	HttpUrl,
 	SecretStr,
-	computed_field,
 	field_serializer,
 	model_validator,
 )
@@ -51,12 +51,22 @@ class WorkType(str, Enum):
 		}.get(code)
 
 
+@dataclass(frozen=True, slots=True)
+class FillInstruction:
+	"""Internal instruction for filling a specific attendance day."""
+
+	type: WorkType
+	date: date
+	entry_time: Optional[time]
+	exit_time: Optional[time]
+
+
 class AttendancePattern(BaseModel):
 	"""Default attendance pattern with per-day work types."""
 
 	entry_time: time = Field(default=time(9, 0))
 	exit_time: time = Field(default=time(18, 0))
-	days: dict[str, WorkType] = Field(
+	days: dict[Weekdays, WorkType] = Field(
 		default_factory=lambda: {
 			Weekdays.SUNDAY: WorkType.OFFICE,
 			Weekdays.MONDAY: WorkType.OFFICE,
@@ -74,18 +84,16 @@ class AttendancePattern(BaseModel):
 		return self
 
 	@property
-	def work_days(self) -> list[int]:
-		"""Get list of work day numbers."""
-		return [
-			wd.number
-			for day in self.days
-			if self.days[day] != WorkType.SKIP and (wd := Weekdays.from_name(day)) is not None
-		]
+	def work_days(self) -> frozenset[int]:
+		"""Get work day numbers as a set for fast membership checks."""
+		return frozenset(
+			day.number for day, work_type in self.days.items() if work_type != WorkType.SKIP
+		)
 
 	def get_work_type(self, weekday: int) -> Optional[WorkType]:
 		"""Get work type for a weekday number."""
 		day = Weekdays.from_number(weekday)
-		if day and day.value in self.days and (wt := self.days[day.value]) != WorkType.SKIP:
+		if day and day in self.days and (wt := self.days[day]) != WorkType.SKIP:
 			return wt
 		return None
 
@@ -141,31 +149,26 @@ class AttendanceRecord(BaseModel):
 	work_type: Optional[WorkType] = None
 	note: Optional[str] = None
 
-	@computed_field
 	@property
 	def has_existing_entry(self) -> bool:
 		"""Whether an entry time was recorded."""
 		return self.entry_time is not None
 
-	@computed_field
 	@property
 	def has_existing_exit(self) -> bool:
 		"""Whether an exit time was recorded."""
 		return self.exit_time is not None
 
-	@computed_field
 	@property
 	def is_empty(self) -> bool:
 		"""Whether no times are recorded."""
 		return not self.has_existing_entry and not self.has_existing_exit
 
-	@computed_field
 	@property
 	def is_complete(self) -> bool:
 		"""Whether both entry and exit times are recorded."""
 		return self.has_existing_entry and self.has_existing_exit
 
-	@computed_field
 	@property
 	def needs_filling(self) -> bool:
 		"""Whether this record needs to be filled."""

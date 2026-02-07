@@ -8,7 +8,7 @@ from rich.prompt import Confirm
 from . import logger
 from .browser import HilanBrowser
 from .display import display_fill_plan, translate_note
-from .models import AttendancePattern, Config, MonthAttendance, WorkType
+from .models import AttendancePattern, Config, FillInstruction, MonthAttendance, WorkType
 
 
 def fill_attendance(
@@ -33,7 +33,7 @@ def fill_attendance(
 	logger.info('🚀 Filling attendance...')
 
 	# Collect all records that need to be filled
-	records_to_fill = []
+	records_to_fill: list[FillInstruction] = []
 
 	for record in attendance.records:
 		# If only_dates specified, skip other dates
@@ -55,11 +55,11 @@ def fill_attendance(
 
 		# Add to batch
 		records_to_fill.append(
-			(
-				record.date,
-				record.entry_time if record.has_existing_entry else pattern.entry_time,
-				record.exit_time if record.has_existing_exit else pattern.exit_time,
-				pattern.get_work_type(record.date.weekday()) or WorkType.OFFICE,
+			FillInstruction(
+				date=record.date,
+				entry_time=record.entry_time if record.has_existing_entry else pattern.entry_time,
+				exit_time=record.exit_time if record.has_existing_exit else pattern.exit_time,
+				type=pattern.get_work_type(record.date.weekday()) or WorkType.OFFICE,
 			)
 		)
 
