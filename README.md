@@ -171,6 +171,26 @@ Hilan uses pay periods that typically run from the 20th of one month to the 19th
 }
 ```
 
+## ✅ Development
+
+Run all project checks with:
+
+```bash
+hatch run check
+```
+
+This runs:
+
+- `ruff format`.
+- `ruff check`.
+- `ty check`.
+
+Build a wheel with:
+
+```bash
+hatch build -t wheel
+```
+
 ## 🧑‍⚖️ License
 
 MIT License - feel free to use and modify!
