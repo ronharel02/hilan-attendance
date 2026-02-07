@@ -141,32 +141,32 @@ class AttendanceRecord(BaseModel):
 	work_type: Optional[WorkType] = None
 	note: Optional[str] = None
 
-	@property
 	@computed_field
+	@property
 	def has_existing_entry(self) -> bool:
 		"""Whether an entry time was recorded."""
 		return self.entry_time is not None
 
-	@property
 	@computed_field
+	@property
 	def has_existing_exit(self) -> bool:
 		"""Whether an exit time was recorded."""
 		return self.exit_time is not None
 
-	@property
 	@computed_field
+	@property
 	def is_empty(self) -> bool:
 		"""Whether no times are recorded."""
 		return not self.has_existing_entry and not self.has_existing_exit
 
-	@property
 	@computed_field
+	@property
 	def is_complete(self) -> bool:
 		"""Whether both entry and exit times are recorded."""
 		return self.has_existing_entry and self.has_existing_exit
 
-	@property
 	@computed_field
+	@property
 	def needs_filling(self) -> bool:
 		"""Whether this record needs to be filled."""
 		return not self.is_complete and not self.note
