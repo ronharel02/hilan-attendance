@@ -506,7 +506,9 @@ class CalendarPage(BasePage):
 
 		selected_count = selected_info.count
 		day_keys = [day_key for day_key in selected_info.dayKeys if day_key]
-		if selected_count > len(detail_rows) and day_keys:
+		# Keep status parsing bulk-first. Per-day fallback is only used when bulk parsing
+		# yielded no rows at all.
+		if selected_count > 0 and not detail_rows and day_keys:
 			clear_btn = self.page.locator(f'input[value="{Buttons.CLEAR}"]')
 			if clear_btn.count() > 0 and clear_btn.is_visible():
 				clear_btn.first.click()
@@ -783,9 +785,7 @@ class CalendarPage(BasePage):
 
 			# Step 2: Click all days in the calendar
 			logger.debug('🖱️  Selecting %d days...', len(records_to_fill))
-			day_numbers = list(
-				dict.fromkeys(instruction.date.day for instruction in records_to_fill)
-			)
+			day_numbers = list(dict.fromkeys(instruction.date.day for instruction in records_to_fill))
 
 			clicked_raw = self.page.evaluate(
 				f"""
@@ -801,13 +801,33 @@ class CalendarPage(BasePage):
 						);
 					}};
 
+					const extractDay = (cell) => {{
+						const ariaLabel = (cell.getAttribute('aria-label') || '').trim();
+						const ariaMatch = ariaLabel.match(/\\d{{1,2}}/);
+						if (ariaMatch) {{
+							return Number.parseInt(ariaMatch[0], 10);
+						}}
+
+						const dtsText = (cell.querySelector('.dTS')?.textContent || '').trim();
+						const dtsMatch = dtsText.match(/\\d{{1,2}}/);
+						if (dtsMatch) {{
+							return Number.parseInt(dtsMatch[0], 10);
+						}}
+
+						return null;
+					}};
+
+					const selectableCells = Array.from(document.querySelectorAll('td[days]')).filter(
+						(cell) =>
+							isVisible(cell) &&
+							(cell.onclick || cell.getAttribute('onclick'))
+					);
+
 					const clickedDays = [];
 					const failedDays = [];
 
 					for (const dayNum of dayNumbers) {{
-						const cells = Array.from(
-							document.querySelectorAll('td[days][aria-label="' + dayNum + '"]')
-						).filter((cell) => isVisible(cell) && (cell.onclick || cell.getAttribute('onclick')));
+						const cells = selectableCells.filter((cell) => extractDay(cell) === dayNum);
 
 						if (cells.length === 0) {{
 							failedDays.push(dayNum);
@@ -867,20 +887,61 @@ class CalendarPage(BasePage):
 					retry_clicked_days: list[int] = []
 					retry_failed_days: list[int] = []
 					for day_num in day_numbers:
-						day_cells = self.page.locator(f'td[days][aria-label="{day_num}"]')
-						day_clicked = False
-						for idx in range(day_cells.count()):
-							cell = day_cells.nth(idx)
-							if not cell.is_visible():
-								continue
-							try:
-								cell.click()
-								retry_clicked_days.append(day_num)
-								day_clicked = True
-								break
-							except Exception:
-								continue
-						if not day_clicked:
+						retry_click_raw = self.page.evaluate(
+							r"""
+							(dayNum) => {
+								const isVisible = (el) => {
+									const style = window.getComputedStyle(el);
+									const rect = el.getBoundingClientRect();
+									return (
+										style.display !== 'none' &&
+										style.visibility !== 'hidden' &&
+										rect.width > 0 &&
+										rect.height > 0
+									);
+								};
+
+								const extractDay = (cell) => {
+									const ariaLabel = (cell.getAttribute('aria-label') || '').trim();
+									const ariaMatch = ariaLabel.match(/\d{1,2}/);
+									if (ariaMatch) {
+										return Number.parseInt(ariaMatch[0], 10);
+									}
+
+									const dtsText = (cell.querySelector('.dTS')?.textContent || '').trim();
+									const dtsMatch = dtsText.match(/\d{1,2}/);
+									if (dtsMatch) {
+										return Number.parseInt(dtsMatch[0], 10);
+									}
+
+									return null;
+								};
+
+								const cells = Array.from(document.querySelectorAll('td[days]')).filter(
+									(cell) =>
+										isVisible(cell) &&
+										(cell.onclick || cell.getAttribute('onclick')) &&
+										extractDay(cell) === dayNum
+								);
+
+								if (cells.length === 0) {
+									return { clicked: false, clickedDay: null };
+								}
+
+								cells[0].click();
+								return { clicked: true, clickedDay: dayNum };
+							}
+							""",
+							day_num,
+						)
+						try:
+							retry_click = CLICK_RESULT_ADAPTER.validate_python(retry_click_raw)
+						except ValidationError:
+							retry_click = _ClickResult()
+
+						if retry_click.clicked:
+							retry_clicked_days.append(day_num)
+						else:
 							retry_failed_days.append(day_num)
 
 					if retry_failed_days:
@@ -920,20 +981,20 @@ class CalendarPage(BasePage):
 
 			result_raw = self.page.evaluate(
 				r"""
-				(fillMap) => {{
-					const pickEditable = (elements) => {{
+				(fillMap) => {
+					const pickEditable = (elements) => {
 						const all = Array.from(elements);
 						if (all.length === 0) return null;
 
 						const editable = all.filter((el) => !el.disabled && !el.readOnly);
 						return editable.length > 0 ? editable[editable.length - 1] : all[all.length - 1];
-					}};
+					};
 
-					const normalizeDate = (dateText) => {{
-						const match = (dateText || '').match(/(\d{{1,2}})\/(\d{{1,2}})/);
+					const normalizeDate = (dateText) => {
+						const match = (dateText || '').match(/(\d{1,2})\/(\d{1,2})/);
 						if (!match) return null;
 						return match[1].padStart(2, '0') + '/' + match[2].padStart(2, '0');
-					}};
+					};
 
 					let filled = 0;
 					let matched = 0;
@@ -941,38 +1002,38 @@ class CalendarPage(BasePage):
 					const dateCells = Array.from(
 						document.querySelectorAll('td[id*="_cellOf_ReportDate_row_"]')
 					);
-					if (dateCells.length === 0) {{
-						return {{ success: false, error: 'No detail rows found', filled: 0, matched: 0 }};
-					}}
+					if (dateCells.length === 0) {
+						return { success: false, error: 'No detail rows found', filled: 0, matched: 0 };
+					}
 
-					for (const [i, dateCell] of dateCells.entries()) {{
-						try {{
+					for (const [i, dateCell] of dateCells.entries()) {
+						try {
 							const idMatch = (dateCell.id || '').match(/_cellOf_ReportDate_row_(\d+)/);
-							if (!idMatch) {{
+							if (!idMatch) {
 								continue;
-							}}
+							}
 							const rowIndex = idMatch[1];
 							const dateRaw = (dateCell.getAttribute('ov') || dateCell.textContent || '').trim();
 							const dateText = normalizeDate(dateRaw);
-							if (!dateText) {{
+							if (!dateText) {
 								errors.push('Row ' + i + ': invalid date text "' + dateRaw + '"');
 								continue;
-							}}
+							}
 
 							const fillData = fillMap[dateText];
-							if (!fillData) {{
+							if (!fillData) {
 								continue;
-							}}
+							}
 							matched++;
 
 							const entryCell = document.querySelector(
-								`td[id*="_cellOf_ManualEntry_EmployeeReports_row_${{rowIndex}}_0"]`
+								`td[id*="_cellOf_ManualEntry_EmployeeReports_row_${rowIndex}_0"]`
 							);
 							const exitCell = document.querySelector(
-								`td[id*="_cellOf_ManualExit_EmployeeReports_row_${{rowIndex}}_0"]`
+								`td[id*="_cellOf_ManualExit_EmployeeReports_row_${rowIndex}_0"]`
 							);
 							const symbolCell = document.querySelector(
-								`td[id*="_cellOf_Symbol.SymbolId_EmployeeReports_row_${{rowIndex}}_0"]`
+								`td[id*="_cellOf_Symbol.SymbolId_EmployeeReports_row_${rowIndex}_0"]`
 							);
 
 							const entryInput = pickEditable(entryCell?.querySelectorAll('input') || []);
@@ -981,46 +1042,46 @@ class CalendarPage(BasePage):
 							let wrote = false;
 
 							// Fill entry time (skip for partial days)
-							if (entryInput && fillData.entry !== null) {{
+							if (entryInput && fillData.entry !== null) {
 								entryInput.value = fillData.entry;
-								entryInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-								entryInput.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+								entryInput.dispatchEvent(new Event('change', { bubbles: true }));
+								entryInput.dispatchEvent(new Event('blur', { bubbles: true }));
 								wrote = true;
-							}}
+							}
 
 							// Fill exit time (skip for partial days)
-							if (exitInput && fillData.exit !== null) {{
+							if (exitInput && fillData.exit !== null) {
 								exitInput.value = fillData.exit;
-								exitInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-								exitInput.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+								exitInput.dispatchEvent(new Event('change', { bubbles: true }));
+								exitInput.dispatchEvent(new Event('blur', { bubbles: true }));
 								wrote = true;
-							}}
+							}
 
 							// Set work type
-							if (symbolSelect) {{
+							if (symbolSelect) {
 								symbolSelect.value = fillData.workCode;
-								symbolSelect.dispatchEvent(new Event('change', {{ bubbles: true }}));
+								symbolSelect.dispatchEvent(new Event('change', { bubbles: true }));
 								wrote = true;
-							}}
+							}
 
-							if (wrote) {{
+							if (wrote) {
 								filled++;
-							}} else {{
+							} else {
 								errors.push('Row ' + i + ': no editable controls for ' + dateText);
-							}}
-						}} catch (err) {{
+							}
+						} catch (err) {
 							errors.push('Row ' + i + ': ' + err.message);
-						}}
-					}}
+						}
+					}
 
-					return {{
+					return {
 						success: filled > 0,
 						filled: filled,
 						totalRows: dateCells.length,
 						matched: matched,
 						errors: errors
-					}};
-				}}
+					};
+				}
 				""",
 				fill_map,
 			)
