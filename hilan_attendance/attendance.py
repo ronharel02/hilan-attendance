@@ -8,7 +8,24 @@ from rich.prompt import Confirm
 from . import logger
 from .browser import HilanBrowser
 from .display import display_fill_plan, translate_note
-from .models import AttendancePattern, Config, FillInstruction, MonthAttendance, WorkType
+from .models import (
+	AttendancePattern,
+	AttendanceRecord,
+	Config,
+	FillInstruction,
+	MonthAttendance,
+	WorkType,
+)
+
+
+def _has_mismatched_work_type(record: AttendanceRecord, pattern: AttendancePattern) -> bool:
+	"""Check if a record has existing work type that differs from pattern expectation."""
+	expected_work_type = pattern.get_work_type(record.date.weekday())
+	return (
+		record.work_type is not None
+		and expected_work_type is not None
+		and record.work_type != expected_work_type
+	)
 
 
 def fill_attendance(
@@ -48,6 +65,17 @@ def fill_attendance(
 		if record.is_complete:
 			continue
 
+		# Skip days with existing work type that doesn't match current pattern
+		if _has_mismatched_work_type(record, pattern):
+			expected_work_type = pattern.get_work_type(record.date.weekday())
+			logger.debug(
+				'⏭ %s work type mismatch (existing=%s, pattern=%s)',
+				record.date.strftime('%d/%m'),
+				record.work_type.value if record.work_type else '-',
+				expected_work_type.value if expected_work_type else '-',
+			)
+			continue
+
 		# Skip days with special status (sick, vacation, etc.)
 		if record.note:
 			logger.debug('⏭ %s (%s)', record.date.strftime('%d/%m'), translate_note(record.note))
@@ -59,7 +87,9 @@ def fill_attendance(
 				date=record.date,
 				entry_time=record.entry_time if record.has_existing_entry else pattern.entry_time,
 				exit_time=record.exit_time if record.has_existing_exit else pattern.exit_time,
-				type=pattern.get_work_type(record.date.weekday()) or WorkType.OFFICE,
+				type=record.work_type
+				or pattern.get_work_type(record.date.weekday())
+				or WorkType.OFFICE,
 			)
 		)
 
@@ -151,7 +181,10 @@ def run_attendance_flow(
 		to_fill = [
 			r
 			for r in attendance.records
-			if r.date.weekday() in config.pattern.work_days and not r.is_complete and not r.note
+			if r.date.weekday() in config.pattern.work_days
+			and not r.is_complete
+			and not r.note
+			and not _has_mismatched_work_type(r, config.pattern)
 		]
 
 		# If up_to_today, filter to days <= today
